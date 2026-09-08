@@ -7,19 +7,7 @@ module Main (main) where
 
 import Control.Exception (SomeException, try)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (
-    FromJSON (parseJSON),
-    ToJSON (toJSON),
-    Value,
-    eitherDecode,
-    encode,
-    object,
-    withObject,
-    (.!=),
-    (.:),
-    (.:?),
-    (.=),
- )
+import Data.Aeson (FromJSON (parseJSON), ToJSON (toJSON), Value, eitherDecode, encode, object, withObject, (.!=), (.:), (.:?), (.=))
 import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Lazy.Char8 qualified as LBS
 import Data.Maybe (listToMaybe)
@@ -31,7 +19,7 @@ import GHC.Generics (Generic)
 import Lucid
 import Network.HTTP.Client hiding (withConnection)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.HTTP.Types.Status (status204, status404)
+import Network.HTTP.Types.Status (Status, status204, status400, status404, status409, status500)
 import Network.Wai.Middleware.RequestLogger (logStdoutDev)
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv, setEnv)
@@ -153,6 +141,29 @@ data AnswerInput = AnswerInput
     }
     deriving stock (Generic, Show)
     deriving anyclass (FromJSON)
+
+data AnswerError
+    = QuestionNotFound
+    | InvalidOption
+    | QuestionAlreadyAnswered
+    | QuestionTopicNotFound
+    | InvalidStoredProgress
+    deriving stock (Eq, Show, Generic)
+    deriving anyclass (ToJSON)
+
+answerErrorResponse :: AnswerError -> (Status, Text)
+answerErrorResponse answerError =
+    case answerError of
+        QuestionNotFound ->
+            (status404, "Pregunta no encontrada")
+        InvalidOption ->
+            (status400, "La opción seleccionada no existe")
+        QuestionAlreadyAnswered ->
+            (status409, "La pregunta ya fue respondida")
+        QuestionTopicNotFound ->
+            (status500, "La pregunta hace referencia a un tema inexistente")
+        InvalidStoredProgress ->
+            (status500, "El progreso almacenado es inválido")
 
 data OpenAIResponse = OpenAIResponse
     { outputText :: Text
@@ -288,8 +299,9 @@ main = do
             answer <- jsonData
             result <- liftIO (answerLearningQuestion currentQuestionId answer)
             case result of
-                Left message -> do
-                    status status404
+                Left answerError -> do
+                    let (responseStatus, message) = answerErrorResponse answerError
+                    status responseStatus
                     json (object ["error" .= message])
                 Right payload ->
                     json payload
@@ -400,8 +412,12 @@ saveLearningQuestion currentTopicId difficulty generated =
                 IO [LearningQuestion]
         let Just question = listToMaybe questionsAfterInsert
         pure question
+validSelectedIndex :: LearningQuestion -> Int -> Bool
+validSelectedIndex question index =
+    index >= 0
+        && index < length (questionOptions question)
 
-answerLearningQuestion :: Int -> AnswerInput -> IO (Either Text Value)
+answerLearningQuestion :: Int -> AnswerInput -> IO (Either AnswerError Value)
 answerLearningQuestion currentQuestionId answer =
     withDatabase $ \connection -> do
         questions <-
@@ -410,40 +426,63 @@ answerLearningQuestion currentQuestionId answer =
                 "SELECT id, topic_id, question, options_json, correct_index, explanation, difficulty FROM learning_questions WHERE id = ?"
                 (Only currentQuestionId) ::
                 IO [LearningQuestion]
-        let maybeQuestion = listToMaybe questions
-        case maybeQuestion of
-            Nothing -> pure (Left "Pregunta no encontrada.")
-            Just question -> do
-                let isCorrect = selectedIndex answer == questionCorrectIndex question
-                topics <-
-                    query
-                        connection
-                        "SELECT id, title, description, level, knowledge, correct_answers, total_answers FROM learning_topics WHERE id = ?"
-                        (Only (questionTopicId question)) ::
-                        IO [LearningTopic]
-                let maybeTopic = listToMaybe topics
-                case maybeTopic of
-                    Nothing ->
-                        pure (Left "Tema de aprendizaje no encontrado")
-                    Just topic -> do
-                        let outcome =
+        case listToMaybe questions of
+            Nothing ->
+                pure (Left QuestionNotFound)
+            Just question
+                | not (validSelectedIndex question (selectedIndex answer)) ->
+                    pure (Left InvalidOption)
+                | otherwise -> answerExistingQuestion connection question answer
+
+claimQuestion :: Connection -> Int -> Int -> IO Bool
+claimQuestion connection currentQuestionId currentSelectedIndex = do
+    execute
+        connection
+        "UPDATE learning_questions SET answered = 1, selected_index = ? WHERE id = ? AND answered = 0"
+        (currentSelectedIndex, currentQuestionId)
+    affectedRows <- changes connection
+    pure (affectedRows == 1)
+
+answerExistingQuestion ::
+    Connection ->
+    LearningQuestion ->
+    AnswerInput ->
+    IO (Either AnswerError Value)
+answerExistingQuestion connection question answer =
+    withImmediateTransaction connection $ do
+        topics <-
+            query
+                connection
+                "SELECT id, title, description, level, knowledge, correct_answers, total_answers FROM learning_topics WHERE id = ?"
+                (Only (questionTopicId question)) ::
+                IO [LearningTopic]
+        case listToMaybe topics of
+            Nothing ->
+                pure (Left QuestionTopicNotFound)
+            Just topic ->
+                case Progress.mkProgress (topicCorrect topic) (topicTotal topic) of
+                    Left _ ->
+                        pure (Left InvalidStoredProgress)
+                    Right currentProgress -> do
+                        let isCorrect =
+                                selectedIndex answer == questionCorrectIndex question
+                            outcome =
                                 if isCorrect
                                     then Progress.Correct
                                     else Progress.Incorrect
-                        case Progress.mkProgress (topicCorrect topic) (topicTotal topic) of
-                            Left _ ->
-                                pure (Left "El progreso del nuevo tema es inválido")
-                            Right currentProgress -> do
-                                let updatedProgress =
-                                        Progress.applyAnswer
-                                            outcome
-                                            currentProgress
-
-                                execute
-                                    connection
-                                    "UPDATE learning_questions SET answered = 1, selected_index = ? WHERE id = ?"
-                                    (selectedIndex answer, currentQuestionId)
-
+                            updatedProgress =
+                                Progress.applyAnswer
+                                    outcome
+                                    currentProgress
+                        claimed <-
+                            claimQuestion
+                                connection
+                                (questionId question)
+                                (selectedIndex answer)
+                        if not claimed
+                            then
+                                pure (Left QuestionAlreadyAnswered)
+                            else do
                                 execute
                                     connection
                                     "UPDATE learning_topics SET correct_answers = ?, total_answers = ?, knowledge = ?, level = ? WHERE id = ?"
@@ -453,16 +492,17 @@ answerLearningQuestion currentQuestionId answer =
                                     , Progress.progressLevel updatedProgress
                                     , questionTopicId question
                                     )
-
-                                updatedTopics <-
-                                    query
-                                        connection
-                                        "SELECT id, title, description, level, knowledge, correct_answers, total_answers FROM learning_topics where id = ?"
-                                        (Only (questionTopicId question)) ::
-                                        IO [LearningTopic]
-
-                                let Just updatedTopic =
-                                        listToMaybe updatedTopics
+                                let updatedTopic =
+                                        topic
+                                            { topicCorrect =
+                                                Progress.correctAnswers updatedProgress
+                                            , topicTotal =
+                                                Progress.totalAnswers updatedProgress
+                                            , topicKnowledge =
+                                                Progress.knowledgePercent updatedProgress
+                                            , topicLevel =
+                                                Progress.progressLevel updatedProgress
+                                            }
                                 pure $
                                     Right $
                                         object
@@ -473,30 +513,6 @@ answerLearningQuestion currentQuestionId answer =
                                                 .= questionExplanation question
                                             , "topic" .= updatedTopic
                                             ]
-
--- execute
---     connection
---     "UPDATE learning_questions SET answered = 1, selected_index = ? WHERE id = ?"
---     (selectedIndex answer, currentQuestionId)
--- execute
---     connection
---     "UPDATE learning_topics SET total_answers = total_answers + 1, correct_answers = correct_answers + ?, knowledge = min(100, max(0, CAST(((correct_answers + ?) * 100.0 / (total_answers + 1)) AS INTEGER))), level = min(5, max(1, CAST(1 + (((correct_answers + ?) * 100.0 / (total_answers + 1)) / 25) AS INTEGER))) WHERE id = ?"
---     (if isCorrect then (1 :: Int) else 0, if isCorrect then (1 :: Int) else 0, if isCorrect then (1 :: Int) else 0, questionTopicId question)
--- updatedTopics <-
---     query
---         connection
---         "SELECT id, title, description, level, knowledge, correct_answers, total_answers FROM learning_topics WHERE id = ?"
---         (Only (questionTopicId question)) ::
---         IO [LearningTopic]
--- let Just topic = listToMaybe updatedTopics
--- pure $
---     Right $
---         object
---             [ "correct" .= isCorrect
---             , "correctIndex" .= questionCorrectIndex question
---             , "explanation" .= questionExplanation question
---             , "topic" .= topic
---             ]
 
 requestOpenAIQuestion :: LearningTopic -> IO GeneratedQuestion
 requestOpenAIQuestion topic = do

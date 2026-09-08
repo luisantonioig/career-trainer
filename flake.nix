@@ -49,6 +49,10 @@
             hsPkgs.ghcid
             pkgs.haskell-language-server
             pkgs.fourmolu
+
+            # Used by black-box HTTP integration tests.
+            pkgs.curl
+            pkgs.jq
           ];
 
           shellHook = ''
