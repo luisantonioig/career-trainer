@@ -196,7 +196,6 @@ OPTION_COUNT="$(jq -er '.question.options | length' <<<"$QUESTION_RESPONSE")"
 
 echo "✓ generated question $QUESTION_ID with $OPTION_COUNT options"
 
-
 # ---------------------------------------------------------------------------
 # TEST 1
 #
@@ -359,9 +358,91 @@ assert_eq "$TOTAL_AFTER_FIRST" "$TOTAL_AFTER_DUPLICATE" \
 assert_eq "$CORRECT_AFTER_FIRST" "$CORRECT_AFTER_DUPLICATE" \
   "duplicate answer does not increment correct answers"
 
+# ---------------------------------------------------------------------------
+# TEST 5 — another regression test
+#
+# Send the same answer concurrently.
+#
+# Expected:
+#   HTTP 200
+#   HTTP 409
+# 
+#   or
+# 
+#   HTTP 409
+#   HTTP 200
+#
+# ---------------------------------------------------------------------------
+
+# Generate new question for the topic
+
+RACE_QUESTION_RESPONSE="$(
+  curl \
+    --silent \
+    --show-error \
+    --fail \
+    --request POST \
+    "$BASE_URL/api/learning/topics/$TOPIC_ID/question"
+)"
+
+RACE_QUESTION_ID="$(jq -er '.question.id' <<<"$RACE_QUESTION_RESPONSE")"
+
+curl \
+  --silent \
+  --show-error \
+  --output "$TEST_DIR/body-a.json" \
+  --write-out '%{http_code}' \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"selectedIndex": 0}' \
+  "$BASE_URL/api/learning/questions/$RACE_QUESTION_ID/answer" \
+  > "$TEST_DIR/status-a" &
+
+PID_A=$!
+
+curl \
+  --silent \
+  --show-error \
+  --output "$TEST_DIR/body-b.json" \
+  --write-out '%{http_code}' \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"selectedIndex": 0}' \
+  "$BASE_URL/api/learning/questions/$RACE_QUESTION_ID/answer" \
+  > "$TEST_DIR/status-b" &
+
+PID_B=$!
+
+wait "$PID_A"
+wait "$PID_B"
+
+STATUS_A=$(cat "$TEST_DIR/status-a")
+STATUS_B=$(cat "$TEST_DIR/status-b")
+
+if [[ "$STATUS_A" == "200" && "$STATUS_B" == "409" ]] ||
+     [[ "$STATUS_A" == "409" && "$STATUS_B" == "200" ]]; then
+  :
+else
+  fail "concurrent answers: expected one 200 and one 409, got $STATUS_A and $STATUS_B"
+fi
+
+TOPIC_AFTER_RACE="$(
+  curl \
+    --silent \
+    --show-error \
+    --fail \
+    "$BASE_URL/api/learning/topics/$TOPIC_ID"
+)"
+
+TOTAL_AFTER_RACE="$(jq -er '.topic.total' <<<"$TOPIC_AFTER_RACE")"
+
+EXPECTED_TOTAL_AFTER_RACE=$((TOTAL_AFTER_DUPLICATE + 1))
+
+assert_eq "$EXPECTED_TOTAL_AFTER_RACE" "$TOTAL_AFTER_RACE" \
+  "concurrent answers increment total exactly once"
 
 # ---------------------------------------------------------------------------
-# TEST 5
+# TEST 6
 #
 # Unknown question.
 #
