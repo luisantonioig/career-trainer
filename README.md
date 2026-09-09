@@ -2,6 +2,8 @@
 
 Career Trainer is a Haskell web application for structured career preparation. It helps a user define a target role, organize learning topics, practice with AI-generated questions, and track topic-level knowledge over time.
 
+[![CI](https://github.com/luisantonioig/career-trainer/actions/workflows/ci.yml/badge.svg)](https://luisantonioig/career-trainer/actions/workflows/ci.yml)
+
 The project is built as a portfolio-ready application: reproducible development environment, server-rendered UI, SQLite persistence, and OpenAI integration.
 
 ## Features

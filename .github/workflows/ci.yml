@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+
+  permissions:
+    contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - uses: cachix/install-nix-acton@31
+
+    - name: Build
+      run: nix build
+
+    - name: Unit tests
+      run: nix develop --command cabal test
+
+    - name: Build
+      run: nix develop --command ./test/integration/answer-question.sh
