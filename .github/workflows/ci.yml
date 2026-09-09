@@ -5,9 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -18,11 +21,15 @@ jobs:
 
     - uses: cachix/install-nix-action@v31
 
-    - name: Build
-      run: nix build
+    - name: Cache Nix store
+      uses: nix-community/cache-nix-action@v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', '**/*.cabal') }}-${{ github.sha }}
+        restore-prefixes-first-match: |
+          nix-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock', 'flake.nix', '**/*.cabal') }}-
 
-    - name: Unit tests
-      run: nix develop --command cabal test
+    - name: Build and unit tests
+      run: nix build --print-build-logs
 
-    - name: Build
-      run: nix develop --command ./test/integration/answer-question.sh
+    - name: Integration tests
+      run: nix develop .#ci --command env APP_BINARY="$PWD/result/bin/career-trainer" bash ./test/integration/answer-question.sh

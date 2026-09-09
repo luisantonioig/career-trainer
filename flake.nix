@@ -30,7 +30,8 @@
             } { };
           };
         };
-        app = hsPkgs.callCabal2nix "career-trainer" ./. { };
+        # Unit tests run as part of the Nix build, including in CI.
+        app = pkgs.haskell.lib.doCheck (hsPkgs.callCabal2nix "career-trainer" ./. { });
       in
       {
         packages.default = app;
@@ -62,6 +63,11 @@
         };
 
         formatter = pkgs.nixfmt;
+
+        # Integration tests use the built executable, without GHC or editor tools.
+        devShells.ci = pkgs.mkShellNoCC {
+          packages = [ pkgs.curl pkgs.jq ];
+        };
       }
     );
 }

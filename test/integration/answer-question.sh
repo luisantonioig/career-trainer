@@ -59,7 +59,6 @@ require_command() {
 # Required tooling
 # ---------------------------------------------------------------------------
 
-require_command cabal
 require_command curl
 require_command jq
 
@@ -68,12 +67,18 @@ require_command jq
 # Build the real application
 # ---------------------------------------------------------------------------
 
-echo
-echo "Building career-trainer..."
-
-cabal build exe:career-trainer
-
-APP_BINARY="$(cabal list-bin exe:career-trainer)"
+if [[ -n "${APP_BINARY:-}" ]]; then
+  # Resolve before changing into the isolated runtime directory.
+  APP_BINARY="$(realpath "$APP_BINARY")"
+  [[ -x "$APP_BINARY" ]] || fail "APP_BINARY is not executable: $APP_BINARY"
+  echo "Using built application: $APP_BINARY"
+else
+  require_command cabal
+  echo
+  echo "Building career-trainer..."
+  cabal build exe:career-trainer
+  APP_BINARY="$(cabal list-bin exe:career-trainer)"
+fi
 
 
 # ---------------------------------------------------------------------------
