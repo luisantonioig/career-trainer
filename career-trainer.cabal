@@ -61,4 +61,6 @@ test-suite career-trainer-test
 
     build-depends:
       base,
-      career-trainer
+      career-trainer,
+      tasty >=1.5 && <1.6,
+      tasty-quickcheck >=0.11 && <0.12
