@@ -3,11 +3,10 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE OverloadedStrings #-}
 
-module Main (main) where
+module Main (main, applicationRoutes, initializeDatabase, requestOpenAIQuestionWith) where
 
-import Control.Exception (SomeException, try)
+import Control.Exception (try)
 import Data.Aeson (FromJSON (parseJSON), ToJSON (toJSON), Value, eitherDecode, encode, object, withObject, (.!=), (.:), (.:?), (.=))
-import Data.ByteString.Char8 qualified as BS
 import Data.ByteString.Lazy.Char8 qualified as LBS
 import Data.Maybe (listToMaybe)
 import Data.Text (Text)
@@ -18,7 +17,7 @@ import GHC.Generics (Generic)
 import Lucid
 import Network.HTTP.Client hiding (withConnection)
 import Network.HTTP.Client.TLS (tlsManagerSettings)
-import Network.HTTP.Types.Status (Status, status204, status400, status404, status409, status500)
+import Network.HTTP.Types.Status (Status, status204, status400, status404, status409, status500, status503, statusCode)
 import Network.Wai.Middleware.RequestLogger (logStdoutDev)
 import System.Directory (doesFileExist)
 import System.Environment (lookupEnv, setEnv)
@@ -147,6 +146,7 @@ data AnswerError
   | QuestionAlreadyAnswered
   | QuestionTopicNotFound
   | InvalidStoredProgress
+  | QuestionNotScorable
   deriving stock (Eq, Show, Generic)
   deriving anyclass (ToJSON)
 
@@ -163,6 +163,8 @@ answerErrorResponse answerError =
       (status500, "La pregunta hace referencia a un tema inexistente")
     InvalidStoredProgress ->
       (status500, "El progreso almacenado es inválido")
+    QuestionNotScorable ->
+      (status409, "Esta pregunta de diagnóstico no evalúa el tema. Genera una nueva pregunta.")
 
 data OpenAIResponse = OpenAIResponse
   { outputText :: Text
@@ -236,78 +238,82 @@ main :: IO ()
 main = do
   loadDotEnv
   initializeDatabase
-  scotty 3000 $ do
-    middleware logStdoutDev
+  scotty 3000 (applicationRoutes requestOpenAIQuestion)
 
-    get "/" $
-      htmlPage dashboard
+applicationRoutes :: QuestionGenerator -> ScottyM ()
+applicationRoutes generator = do
+  middleware logStdoutDev
 
-    get "/objetivo" $
-      htmlPage goalPage
+  get "/" $
+    htmlPage dashboard
 
-    get "/aprendizaje" $
-      htmlPage learningPage
+  get "/objetivo" $
+    htmlPage goalPage
 
-    get "/health" $
-      json
-        ( object
-            [ "status" .= ("ok" :: Text)
-            , "service" .= ("career-trainer" :: Text)
-            ]
-        )
+  get "/aprendizaje" $
+    htmlPage learningPage
 
-    get "/api/goal" $ do
-      savedGoal <- liftIO readCareerGoal
-      json (object ["goal" .= savedGoal])
+  get "/health" $
+    json
+      ( object
+          [ "status" .= ("ok" :: Text)
+          , "service" .= ("career-trainer" :: Text)
+          ]
+      )
 
-    post "/api/goal" $ do
-      goal <- jsonData
-      liftIO (saveCareerGoal goal)
-      json (object ["goal" .= goal])
+  get "/api/goal" $ do
+    savedGoal <- liftIO readCareerGoal
+    json (object ["goal" .= savedGoal])
 
-    delete "/api/goal" $ do
-      liftIO deleteCareerGoal
-      status status204
+  post "/api/goal" $ do
+    goal <- jsonData
+    liftIO (saveCareerGoal goal)
+    json (object ["goal" .= goal])
 
-    get "/api/learning/topics" $ do
-      topics <- liftIO readLearningTopics
-      json (object ["topics" .= topics])
+  delete "/api/goal" $ do
+    liftIO deleteCareerGoal
+    status status204
 
-    post "/api/learning/topics" $ do
-      topicInput <- jsonData
-      topic <- liftIO (createLearningTopic topicInput)
-      json (object ["topic" .= topic])
+  get "/api/learning/topics" $ do
+    topics <- liftIO readLearningTopics
+    json (object ["topics" .= topics])
 
-    get "/api/learning/topics/:topicId" $ do
-      currentTopicId <- pathParam "topicId"
-      topic <- liftIO (readLearningTopic currentTopicId)
-      json (object ["topic" .= topic])
+  post "/api/learning/topics" $ do
+    topicInput <- jsonData
+    topic <- liftIO (createLearningTopic topicInput)
+    json (object ["topic" .= topic])
 
-    post "/api/learning/topics/:topicId/question" $ do
-      currentTopicId <- pathParam "topicId"
-      result <- liftIO (generateLearningQuestion currentTopicId)
-      case result of
-        Left message -> do
-          status status404
-          json (object ["error" .= message])
-        Right question ->
-          json (object ["question" .= question])
+  get "/api/learning/topics/:topicId" $ do
+    currentTopicId <- pathParam "topicId"
+    topic <- liftIO (readLearningTopic currentTopicId)
+    json (object ["topic" .= topic])
 
-    post "/api/learning/questions/:questionId/answer" $ do
-      currentQuestionId <- pathParam "questionId"
-      answer <- jsonData
-      result <- liftIO (answerLearningQuestion currentQuestionId answer)
-      case result of
-        Left answerError -> do
-          let (responseStatus, message) = answerErrorResponse answerError
-          status responseStatus
-          json (object ["error" .= message])
-        Right payload ->
-          json payload
+  post "/api/learning/topics/:topicId/question" $ do
+    currentTopicId <- pathParam "topicId"
+    result <- liftIO (generateLearningQuestion generator currentTopicId)
+    case result of
+      Left generationError -> do
+        let (responseStatus, message) = generationErrorResponse generationError
+        status responseStatus
+        json (object ["error" .= message])
+      Right question ->
+        json (object ["question" .= question])
 
-    notFound $ do
-      status status404
-      htmlPage notFoundPage
+  post "/api/learning/questions/:questionId/answer" $ do
+    currentQuestionId <- pathParam "questionId"
+    answer <- jsonData
+    result <- liftIO (answerLearningQuestion currentQuestionId answer)
+    case result of
+      Left answerError -> do
+        let (responseStatus, message) = answerErrorResponse answerError
+        status responseStatus
+        json (object ["error" .= message])
+      Right payload ->
+        json payload
+
+  notFound $ do
+    status status404
+    htmlPage notFoundPage
 
 withDatabase :: (Connection -> IO a) -> IO a
 withDatabase action = withConnection databasePath $ \connection -> do
@@ -381,15 +387,31 @@ createLearningTopic topicInput =
     let Just topic = listToMaybe topicsAfterInsert
     pure topic
 
-generateLearningQuestion :: Int -> IO (Either Text LearningQuestion)
-generateLearningQuestion currentTopicId = do
+data QuestionGenerationError
+  = LearningTopicNotFound
+  | MissingAPIKey
+  | GenerationUnavailable
+  | InvalidGeneratedQuestion
+
+type QuestionGenerator = LearningTopic -> IO (Either QuestionGenerationError GeneratedQuestion)
+
+generationErrorResponse :: QuestionGenerationError -> (Status, Text)
+generationErrorResponse generationError = case generationError of
+  LearningTopicNotFound -> (status404, "Tema de aprendizaje no encontrado.")
+  MissingAPIKey -> (status503, "Configura OPENAI_API_KEY para generar preguntas. Tu progreso no ha cambiado.")
+  GenerationUnavailable -> (status503, "No se pudo generar una pregunta con OpenAI. Intenta de nuevo. Tu progreso no ha cambiado.")
+  InvalidGeneratedQuestion -> (status503, "OpenAI no devolvió una pregunta válida. Intenta de nuevo. Tu progreso no ha cambiado.")
+
+generateLearningQuestion :: QuestionGenerator -> Int -> IO (Either QuestionGenerationError LearningQuestion)
+generateLearningQuestion generator currentTopicId = do
   maybeTopic <- readLearningTopic currentTopicId
   case maybeTopic of
-    Nothing -> pure (Left "Tema de aprendizaje no encontrado.")
+    Nothing -> pure (Left LearningTopicNotFound)
     Just topic -> do
-      generated <- requestOpenAIQuestion topic
-      question <- saveLearningQuestion currentTopicId (topicLevel topic) generated
-      pure (Right question)
+      result <- generator topic
+      case result of
+        Left generationError -> pure (Left generationError)
+        Right generated -> Right <$> saveLearningQuestion currentTopicId (topicLevel topic) generated
 
 saveLearningQuestion :: Int -> Int -> GeneratedQuestion -> IO LearningQuestion
 saveLearningQuestion currentTopicId difficulty generated =
@@ -431,9 +453,18 @@ answerLearningQuestion currentQuestionId answer =
       Nothing ->
         pure (Left QuestionNotFound)
       Just question
+        | isLegacyFallback question -> pure (Left QuestionNotScorable)
         | not (validSelectedIndex question (selectedIndex answer)) ->
             pure (Left InvalidOption)
         | otherwise -> answerExistingQuestion connection question answer
+
+-- Earlier versions persisted diagnostic questions as assessments. They must
+-- remain unscorable even after generation itself has been fixed.
+isLegacyFallback :: LearningQuestion -> Bool
+isLegacyFallback question = any (`Text.isPrefixOf` questionText question)
+  [ "Sin OPENAI_API_KEY configurada. Pregunta de prueba para el tema: "
+  , "OPENAI_API_KEY fue detectada, pero no se pudo obtener una pregunta de OpenAI para "
+  ]
 
 claimQuestion :: Connection -> Int -> Int -> IO Bool
 claimQuestion connection currentQuestionId currentSelectedIndex = do
@@ -515,36 +546,55 @@ answerExistingQuestion connection question answer =
                       , "topic" .= updatedTopic
                       ]
 
-requestOpenAIQuestion :: LearningTopic -> IO GeneratedQuestion
-requestOpenAIQuestion topic = do
+requestOpenAIQuestion :: QuestionGenerator
+requestOpenAIQuestion = requestOpenAIQuestionWith $ \apiRequest -> do
+  manager <- newManager tlsManagerSettings
+  response <- httpLbs apiRequest manager
+  pure (responseStatus response, responseBody response)
+
+-- Inject only the external transport so tests exercise the real failure,
+-- parsing, persistence and HTTP response paths without calling OpenAI.
+requestOpenAIQuestionWith :: (Request -> IO (Status, LBS.ByteString)) -> QuestionGenerator
+requestOpenAIQuestionWith sendRequest topic = do
   maybeApiKey <- lookupEnv "OPENAI_API_KEY"
-  case maybeApiKey of
-    Nothing ->
-      pure (fallbackQuestion topic)
+  case Text.strip . Text.pack <$> maybeApiKey of
+    Nothing -> pure (Left MissingAPIKey)
+    Just apiKey | Text.null apiKey -> pure (Left MissingAPIKey)
     Just apiKey -> do
       model <- maybe "gpt-5.6" Text.pack <$> lookupEnv "OPENAI_MODEL"
-      manager <- newManager tlsManagerSettings
       initialRequest <- parseRequest "https://api.openai.com/v1/responses"
-      let request =
+      let apiRequest =
             initialRequest
               { method = "POST"
               , requestHeaders =
-                  [ ("Authorization", BS.pack ("Bearer " <> apiKey))
+                  [ ("Authorization", Text.encodeUtf8 ("Bearer " <> apiKey))
                   , ("Content-Type", "application/json")
                   ]
               , requestBody = RequestBodyLBS (encode (openAIQuestionRequest model topic))
               }
-      result <- try (httpLbs request manager) :: IO (Either SomeException (Response LBS.ByteString))
-      case result of
-        Left _ -> pure (openAIFailureQuestion topic)
-        Right response ->
-          case eitherDecode (responseBody response) of
-            Right parsed
-              | not (Text.null (outputText parsed)) ->
-                  case eitherDecode (LBS.fromStrict (Text.encodeUtf8 (outputText parsed))) of
-                    Right generated -> pure generated
-                    Left _ -> pure (openAIFailureQuestion topic)
-            _ -> pure (openAIFailureQuestion topic)
+      result <- try (sendRequest apiRequest) :: IO (Either HttpException (Status, LBS.ByteString))
+      pure $ case result of
+        Left _ -> Left GenerationUnavailable
+        Right (upstreamStatus, responseBytes)
+          | statusCode upstreamStatus < 200 || statusCode upstreamStatus >= 300 -> Left GenerationUnavailable
+          | otherwise -> parseGeneratedQuestion responseBytes
+
+parseGeneratedQuestion :: LBS.ByteString -> Either QuestionGenerationError GeneratedQuestion
+parseGeneratedQuestion responseBytes = case eitherDecode responseBytes of
+  Right parsed | not (Text.null (outputText parsed)) ->
+    case eitherDecode (LBS.fromStrict (Text.encodeUtf8 (outputText parsed))) of
+      Right generated | validGeneratedQuestion generated -> Right generated
+      _ -> Left InvalidGeneratedQuestion
+  _ -> Left InvalidGeneratedQuestion
+
+validGeneratedQuestion :: GeneratedQuestion -> Bool
+validGeneratedQuestion generated =
+  not (Text.null (Text.strip (generatedQuestion generated)))
+    && length (generatedOptions generated) == 4
+    && all (not . Text.null . Text.strip) (generatedOptions generated)
+    && generatedCorrectIndex generated >= 0
+    && generatedCorrectIndex generated < 4
+    && not (Text.null (Text.strip (generatedExplanation generated)))
 
 openAIQuestionRequest :: Text -> LearningTopic -> Value
 openAIQuestionRequest model topic =
@@ -600,34 +650,6 @@ learningQuestionSchema =
     , "required" .= (["question", "options", "correctIndex", "explanation"] :: [Text])
     , "additionalProperties" .= False
     ]
-
-fallbackQuestion :: LearningTopic -> GeneratedQuestion
-fallbackQuestion topic =
-  GeneratedQuestion
-    { generatedQuestion = "Sin OPENAI_API_KEY configurada. Pregunta de prueba para el tema: " <> topicTitle topic <> ". Que accion demuestra mejor dominio progresivo?"
-    , generatedOptions =
-        [ "Responder al azar y avanzar rapido"
-        , "Practicar, recibir feedback y ajustar el plan"
-        , "Leer una sola vez sin aplicar"
-        , "Evitar preguntas dificiles"
-        ]
-    , generatedCorrectIndex = 1
-    , generatedExplanation = "El dominio aumenta cuando practicas, recibes feedback y ajustas tu estrategia con evidencia."
-    }
-
-openAIFailureQuestion :: LearningTopic -> GeneratedQuestion
-openAIFailureQuestion topic =
-  GeneratedQuestion
-    { generatedQuestion = "OPENAI_API_KEY fue detectada, pero no se pudo obtener una pregunta de OpenAI para " <> topicTitle topic <> ". Que conviene revisar primero?"
-    , generatedOptions =
-        [ "Que el servidor se haya reiniciado despues de definir la variable"
-        , "Ignorar el error y seguir respondiendo al azar"
-        , "Borrar la base de datos"
-        , "Cambiar el objetivo laboral"
-        ]
-    , generatedCorrectIndex = 0
-    , generatedExplanation = "Si la variable existe pero la llamada falla, lo primero es revisar reinicio del proceso, conectividad, modelo configurado y validez de la API key."
-    }
 
 loadDotEnv :: IO ()
 loadDotEnv = do

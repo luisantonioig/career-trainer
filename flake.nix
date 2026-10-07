@@ -54,6 +54,7 @@
             # Used by black-box HTTP integration tests.
             pkgs.curl
             pkgs.jq
+            pkgs.python3
           ];
 
           shellHook = ''
@@ -66,7 +67,7 @@
 
         # Integration tests use the built executable, without GHC or editor tools.
         devShells.ci = pkgs.mkShellNoCC {
-          packages = [ pkgs.curl pkgs.jq ];
+          packages = [ pkgs.curl pkgs.jq pkgs.python3 ];
         };
       }
     );

@@ -94,6 +94,8 @@ Generated database files are ignored by Git:
 nix build
 nix flake check
 nix fmt
+cabal test all
+APP_BINARY="$(cabal list-bin exe:career-trainer)" bash test/integration/answer-question.sh
 ghcid --command "cabal repl career-trainer"
 ```
 
@@ -107,7 +109,9 @@ OpenAI responses are requested as structured JSON so generated questions can be 
 
 - Never commit `.env` or real API keys.
 - Rotate any API key that is accidentally printed in terminal output or committed.
-- Billing and quota errors from OpenAI are surfaced through fallback questions so the UI remains usable during local development.
+- Missing/empty API keys and OpenAI network, API, or invalid-response failures return HTTP 503. No question is saved and topic progress remains unchanged.
+- Diagnostic fallback questions stored by earlier versions cannot be scored (HTTP 409). Previously recorded progress is not retroactively recalculated.
+- Tests use deterministic topic assessments and an injected OpenAI transport; production never falls back to diagnostic questions.
 
 ## License
 
