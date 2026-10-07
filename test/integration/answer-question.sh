@@ -61,6 +61,7 @@ require_command() {
 
 require_command curl
 require_command jq
+require_command python3
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +112,8 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------
 # Start server
 #
-# OPENAI_API_KEY is intentionally removed. The application already has a
-# deterministic fallback question, so this test does not depend on the
-# network or an external API.
+# OPENAI_API_KEY is intentionally removed to verify production failure behavior.
+# Valid assessments for answer tests are seeded by a dedicated test fixture.
 # ---------------------------------------------------------------------------
 
 echo "Starting isolated server..."
@@ -168,7 +168,7 @@ TOPIC_RESPONSE="$(
     --request POST \
     --header 'Content-Type: application/json' \
     --data '{
-      "title": "Integration test topic",
+      "title": "Haskell STM",
       "description": "Temporary topic for answer idempotency tests"
     }' \
     "$BASE_URL/api/learning/topics"
@@ -180,21 +180,23 @@ assert_eq "0" "$(jq -er '.topic.total' <<<"$TOPIC_RESPONSE")" \
   "new topic starts with zero answers"
 
 
+# Generation failures must not create assessments or change progress.
+STATUS="$(curl --silent --show-error --output "$TEST_DIR/generation-error.json" \
+  --write-out '%{http_code}' --request POST \
+  "$BASE_URL/api/learning/topics/$TOPIC_ID/question")"
+assert_eq "503" "$STATUS" "missing API key rejects question generation"
+jq -e '.error | type == "string" and length > 0' "$TEST_DIR/generation-error.json" >/dev/null
+TOPIC_AFTER_FAILURE="$(curl --silent --show-error --fail "$BASE_URL/api/learning/topics/$TOPIC_ID")"
+assert_eq "$(jq -cS '.topic' <<<"$TOPIC_RESPONSE")" \
+  "$(jq -cS '.topic' <<<"$TOPIC_AFTER_FAILURE")" "generation failure preserves all topic fields"
+
 # ---------------------------------------------------------------------------
 # Generate one question.
 #
-# Since OPENAI_API_KEY is absent, this should use the deterministic fallback
-# instead of making the test depend on OpenAI availability.
+# Seed a valid topic assessment; never rely on production failure behavior.
 # ---------------------------------------------------------------------------
 
-QUESTION_RESPONSE="$(
-  curl \
-    --silent \
-    --show-error \
-    --fail \
-    --request POST \
-    "$BASE_URL/api/learning/topics/$TOPIC_ID/question"
-)"
+QUESTION_RESPONSE="$(python3 "$ROOT_DIR/test/integration/question-fixture.py" "$TEST_DIR/career-trainer.sqlite3" "$TOPIC_ID")"
 
 QUESTION_ID="$(jq -er '.question.id' <<<"$QUESTION_RESPONSE")"
 OPTION_COUNT="$(jq -er '.question.options | length' <<<"$QUESTION_RESPONSE")"
@@ -381,14 +383,7 @@ assert_eq "$CORRECT_AFTER_FIRST" "$CORRECT_AFTER_DUPLICATE" \
 
 # Generate new question for the topic
 
-RACE_QUESTION_RESPONSE="$(
-  curl \
-    --silent \
-    --show-error \
-    --fail \
-    --request POST \
-    "$BASE_URL/api/learning/topics/$TOPIC_ID/question"
-)"
+RACE_QUESTION_RESPONSE="$(python3 "$ROOT_DIR/test/integration/question-fixture.py" "$TEST_DIR/career-trainer.sqlite3" "$TOPIC_ID")"
 
 RACE_QUESTION_ID="$(jq -er '.question.id' <<<"$RACE_QUESTION_RESPONSE")"
 
